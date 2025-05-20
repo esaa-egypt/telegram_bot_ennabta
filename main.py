@@ -1,100 +1,114 @@
+import os
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ChatMemberHandler,
     PollHandler,
     filters,
-    CallbackQueryHandler,
     ContextTypes,
 )
-from telegram.error import Forbidden, TelegramError
+from telegram.error import Forbidden
 import logging
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# Enable logging for debugging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# ===== Load Environment =====
+load_dotenv()  # Take environment variables from .env
+
+# ===== Configuration =====
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Bot token (replace with your actual token)
-TOKEN = "YOUR_BOT_TOKEN_HERE"
+class Config:
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+    EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+    EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+    TARGET_USER_ID = int(os.getenv("TARGET_USER_ID"))  # Convert to integer
 
-# Email configuration (replace with your details)
-EMAIL_SENDER = "your_email@gmail.com"
-EMAIL_PASSWORD = "your_app_password"  # Use App Password for Gmail
-EMAIL_RECEIVER = "recipient_email@example.com"
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
+    @classmethod
+    def validate(cls):
+        """Check all required environment variables exist"""
+        required_vars = [
+            'BOT_TOKEN', 'EMAIL_SENDER',
+            'EMAIL_PASSWORD', 'EMAIL_RECEIVER',
+            'TARGET_USER_ID'
+        ]
+        missing = [var for var in required_vars if not getattr(cls, var)]
+        if missing:
+            raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
 
-# Target user ID to monitor (replace with the specific user's Telegram ID)
-TARGET_USER_ID = 123456789  # Replace with the actual user ID
+# Validate on startup
+Config.validate()
 
-# Function to send email
-async def send_email(subject: str, body: str):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_SENDER
-        msg['To'] = EMAIL_RECEIVER
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
+# ===== Email Service =====
+class EmailNotifier:
+    @staticmethod
+    async def send_alert(subject: str, body: str):
+        """Thread-safe email sender"""
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = Config.EMAIL_SENDER
+            msg['To'] = Config.EMAIL_RECEIVER
+            msg['Subject'] = subject
+            msg.attach(MIMEText(body, 'plain'))
 
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        logger.info("Email sent successfully")
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+            with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                server.starttls()
+                server.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
+                server.send_message(msg)
+            logger.info("Email alert sent")
+        except Exception as e:
+            logger.error(f"Email failed: {str(e)}")
 
-# Modified message handler to react and email specific user's messages
-async def react_to_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_text = update.message.text
+# ===== Bot Handlers =====
+async def track_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Monitor specific user activity"""
     user = update.message.from_user
+    if user.id == Config.TARGET_USER_ID:
+        alert_msg = (
+            f"🚨 Activity detected\n"
+            f"User: {user.full_name} (ID: {user.id})\n"
+            f"Chat: {update.effective_chat.title}\n"
+            f"Message: {update.message.text}"
+        )
+        await EmailNotifier.send_alert("Telegram Alert", alert_msg)
 
-    # React to "hello" (keeping original functionality)
-    if message_text.lower() in "hello":
-        await update.message.reply_text("Hi there! Nice to see you say hello!")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Secure start handler"""
+    await update.message.reply_text(
+        "🔒 Monitoring bot active\n"
+        f"Tracking user ID: {Config.TARGET_USER_ID}"
+    )
 
-    # Check if the message is from the target user
-    if user.id == TARGET_USER_ID:
-        subject = f"New Message from {user.full_name} in {update.message.chat.title}"
-        body = f"User: {user.full_name} (ID: {user.id})\nChat: {update.message.chat.title}\nMessage: {message_text}\nTime: {update.message.date}"
-        await send_email(subject, body)
-        logger.info(f"Email sent for message from user ID {user.id}")
-
-# Rest of the original code (omitted for brevity, include from previous response)
-# Include all other handlers: start, help, ban, kick, mute, unmute, welcome_new_member, create_poll, handle_poll_answer, error_handler
-
-def main():
-    # Initialize the application
-    application = Application.builder().token(TOKEN).build()
-
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("ban", ban))
-    application.add_handler(CommandHandler("kick", kick))
-    application.add_handler(CommandHandler("mute", mute))
-    application.add_handler(CommandHandler("unmute", unmute))
-    application.add_handler(CommandHandler("poll", create_poll))
-
-    # Add message handler for reacting to text and emailing specific user's messages
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, react_to_message))
-
-    # Add handler for welcoming new members
-    application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
-
-    # Add handler for poll answers
-    application.add_handler(PollHandler(handle_poll_answer))
-
-    # Add error handler
-    application.add_error_handler(error_handler)
-
-    # Start the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+# ===== Main Application =====
+def setup_application() -> Application:
+    """Factory for bot application"""
+    app = Application.builder().token(Config.BOT_TOKEN).build()
+    
+    # Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        track_target_user
+    ))
+    
+    # Error handling
+    app.add_error_handler(lambda u, c: logger.error(f"Error: {c.error}"))
+    
+    return app
 
 if __name__ == "__main__":
-    main()
+    try:
+        app = setup_application()
+        logger.info("Starting bot in polling mode...")
+        app.run_polling()
+    except Exception as e:
+        logger.critical(f"Fatal error: {str(e)}")
+        raise
